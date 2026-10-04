@@ -43,7 +43,7 @@ import storage
 st.set_page_config(page_title="MeetHalfway", page_icon=None, layout="centered")
 
 MODE_OPTIONS = ["Car", "Walking", "Public transport"]
-PURPOSE_OPTIONS = ["Café", "Food", "Study", "Shopping", "Outdoors"]
+PURPOSE_OPTIONS = ["Café", "Food", "Outdoors"]
 
 GOA_BOUNDS = routing.GOA_BOUNDS
 GOA_CENTER = [15.35, 74.00]
@@ -666,7 +666,12 @@ def render_result() -> None:
     def _dist_m(p):
         return optimization.haversine_km(meet_point, (p["lat"], p["lon"])) * 1000.0
 
-    shown = sorted(place_result.get("places") or [], key=_dist_m)[:6]
+    # Nearest six, but always keep any "featured" spots (e.g. a waterfall for
+    # Outdoors), which would otherwise be crowded out by closer parks.
+    _all = sorted(place_result.get("places") or [], key=_dist_m)
+    _featured = [p for p in _all if p.get("featured")]
+    _others = [p for p in _all if not p.get("featured")]
+    shown = sorted(_others[: max(6 - len(_featured), 0)] + _featured, key=_dist_m)
 
     m = folium.Map(location=best["location"], zoom_start=13)
     for person, pt in zip(people, res["points"]):
@@ -755,3 +760,4 @@ with _page.container():
         render_setup(searching=True)
     else:
         render_result()
+
