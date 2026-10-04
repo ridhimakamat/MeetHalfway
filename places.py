@@ -33,10 +33,31 @@ OVERPASS_FALLBACK_URL = "https://overpass.kumi.systems/api/interpreter"
 PURPOSE_TO_OSM_TAGS = {
     "Café": [("amenity", "cafe")],
     "Food": [("amenity", "restaurant"), ("amenity", "fast_food")],
-    "Study": [("amenity", "library"), ("amenity", "cafe")],
-    "Shopping": [("shop", "mall"), ("shop", "supermarket"), ("shop", "department_store")],
-    "Outdoors": [("leisure", "park"), ("leisure", "garden"), ("natural", "beach")],
+    "Outdoors": [
+        ("leisure", "park"),
+        ("leisure", "garden"),
+        ("leisure", "nature_reserve"),
+        ("natural", "beach"),
+        ("tourism", "viewpoint"),
+    ],
 }
+
+# Search radii per purpose. Outdoor spots are sparser than cafes, so widen
+# further before giving up.
+PURPOSE_RADII_M = {
+    "Outdoors": (3000, 8000, 15000),
+}
+DEFAULT_RADII_M = (1500, 3000, 5000)
+
+# Waterfalls are rare and usually far from any given point, so a plain
+# "nearest eight" list would never include one next to a handful of parks.
+# For these purposes they are searched separately over a wide radius, and
+# the nearest few are added to the list.
+PURPOSE_FEATURED_TAGS = {
+    "Outdoors": [("waterway", "waterfall"), ("natural", "waterfall")],
+}
+FEATURED_RADIUS_M = 20000
+FEATURED_MAX = 2
 
 
 class PlacesError(Exception):
@@ -102,9 +123,11 @@ def search_places(
     purpose: str,
     radius_m: int = 1500,
     max_results: int = 8,
+    tags: List[Tuple[str, str]] = None,
 ) -> List[Dict]:
     """Find real venues near the meeting point matching the purpose, nearest first."""
-    tags = PURPOSE_TO_OSM_TAGS.get(purpose, PURPOSE_TO_OSM_TAGS["Café"])
+    if tags is None:
+        tags = PURPOSE_TO_OSM_TAGS.get(purpose, PURPOSE_TO_OSM_TAGS["Café"])
     data = _post_overpass(_build_query(location, radius_m, tags))
 
     places: List[Dict] = []
@@ -157,7 +180,7 @@ def search_places(
 def search_places_with_fallback(
     location: Tuple[float, float],
     purpose: str,
-    radii_m: Tuple[int, ...] = (1500, 3000, 5000),
+    radii_m: Tuple[int, ...] = None,
     max_results: int = 8,
 ) -> Dict:
     """
@@ -173,22 +196,51 @@ def search_places_with_fallback(
             "error": bool,                 # True if the venue service itself failed
         }                                  # (so "none found" isn't confused with "couldn't ask")
     """
+    if radii_m is None:
+        radii_m = PURPOSE_RADII_M.get(purpose, DEFAULT_RADII_M)
+
     failures = 0
     last_error = None
+    found: List[Dict] = []
+    radius_used = None
+    expanded = False
     for i, radius_m in enumerate(radii_m):
         try:
-            found = search_places(location, purpose, radius_m=radius_m, max_results=max_results)
+            results = search_places(location, purpose, radius_m=radius_m, max_results=max_results)
         except PlacesError as exc:
             failures += 1
             last_error = str(exc)
             continue
-        if found:
-            return {"places": found, "radius_used_m": radius_m, "expanded": i > 0, "error": False, "error_detail": None}
+        if results:
+            found, radius_used, expanded = results, radius_m, i > 0
+            break
 
+    # Rare-but-wanted features (e.g. waterfalls for Outdoors), searched wide.
+    featured_tags = PURPOSE_FEATURED_TAGS.get(purpose)
+    if featured_tags:
+        try:
+            extras = search_places(
+                location, purpose, radius_m=FEATURED_RADIUS_M, max_results=FEATURED_MAX, tags=featured_tags
+            )
+        except PlacesError:
+            extras = []
+        for e in extras:
+            e["featured"] = True
+        known = {p_["name"] for p_ in found}
+        found = found + [e for e in extras if e["name"] not in known]
+        found.sort(key=lambda p_: p_["distance_m"])
+        if found and radius_used is None:
+            radius_used, expanded = FEATURED_RADIUS_M, True
+
+    if found:
+        return {"places": found, "radius_used_m": radius_used, "expanded": expanded,
+                "error": False, "error_detail": None}
+
+    all_failed = failures == len(radii_m)
     return {
         "places": [],
         "radius_used_m": None,
         "expanded": True,
-        "error": failures == len(radii_m),
-        "error_detail": last_error if failures == len(radii_m) else None,
+        "error": all_failed,
+        "error_detail": last_error if all_failed else None,
     }
