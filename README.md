@@ -1,6 +1,6 @@
 # MeetHalfway
 
-**Find somewhere everyone can actually reach.**
+**Four people need to meet. Find somewhere everyone can actually reach.**
 
 Two screens. Everyone gets a name, their own travel mode, and a location
 picked from a map of Goa (search or click — no typed address field). Get
