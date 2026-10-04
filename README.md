@@ -148,22 +148,6 @@ fails outright the screen says the lookup service didn't respond, rather
 than claiming nothing exists nearby; the primary instance falls back to a
 mirror before giving up.
 
-### The searching screen
-
-Pressing "Find our spot" no longer runs the slow network work inside the
-button click. It validates, switches to a dedicated "searching" stage that
-renders no map component, and runs the search there. The setup screen's
-map component can trigger its own reruns, and a rerun mid-search aborts it
-and loses the result; the searching screen removes that possibility. Any
-unexpected error returns to setup with a message instead of hanging.
-
-### Colours and theme
-
-The page colours assume a white background, so `.streamlit/config.toml`
-pins Streamlit's light theme and `app.py` pins the main text colours
-explicitly. (This file only sets the theme. It is unrelated to the removed
-`runOnSave` setting.) Secondary greys were darkened for contrast.
-
 ### Persistence and shareable links
 
 Every finished search is saved to a local SQLite file and its id is
