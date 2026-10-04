@@ -1,277 +1,3 @@
-"""
-app.py — MeetHalfway's UI.
-
-Two screens:
-  1. Setup — everyone's name, their own travel mode, and a location picked
-     from a Goa-bounded map (search or click — no free-text address field,
-     so every location is a real point, not an ambiguous string).
-  2. Result — one recommended area, everyone's time to get there, a map,
-     and real places to go.
-
-Every finished search is saved to SQLite (storage.py) and its id is
-written into the page URL (?plan=...). That URL is the shareable link, and
-it's also what makes results survive a page refresh or a dropped
-connection: Streamlit's session_state lives only in server memory, so if
-that session is lost, reloading the page with the plan id still in the URL
-restores the exact same result instead of losing it.
-
-Two additional, concrete fixes for results disappearing mid-session:
-  - storage.py keeps the database file outside this directory, so writing
-    it can't be mistaken by Streamlit's dev-server file watcher for a
-    source-code change.
-  - The result screen's map passes returned_objects=[] to st_folium, since
-    it's informational only — without this, streamlit-folium can fire an
-    extra automatic rerun right after the map's first paint.
-Neither of these can be proven as *the* cause without reproducing it live,
-but both are real, documented footguns that match the symptom, and fixing
-them costs nothing.
-"""
-
-import html
-
-import folium
-import streamlit as st
-from streamlit_folium import st_folium
-
-import optimization
-import places as places_module
-import routing
-import storage
-
-st.set_page_config(page_title="MeetHalfway", page_icon=None, layout="centered")
-
-MODE_OPTIONS = ["Car", "Walking", "Public transport"]
-PURPOSE_OPTIONS = ["Café", "Food", "Study", "Shopping", "Outdoors"]
-
-GOA_BOUNDS = routing.GOA_BOUNDS
-GOA_CENTER = [15.35, 74.00]
-
-# Fixed blend of average and worst-case travel time (see optimization.fairness_stats).
-# 0.5 means the group's average and the single longest journey count equally —
-# no slider exposed in the UI, this is just the formula's one tunable knob.
-FAIRNESS_WEIGHT = 0.5
-
-DEFAULT_PEOPLE = [
-    {"name": "You", "lat": 15.4909, "lon": 73.8278, "label": "Panaji, North Goa", "mode": "Car"},
-    {"name": "Friend 1", "lat": 15.2832, "lon": 73.9862, "label": "Margao, South Goa", "mode": "Car"},
-    {"name": "Friend 2", "lat": 15.4028, "lon": 74.0120, "label": "Ponda, North Goa", "mode": "Car"},
-    {"name": "Friend 3", "lat": 15.3955, "lon": 73.8157, "label": "Vasco da Gama, South Goa", "mode": "Car"},
-]
-
-storage.init_db()
-
-st.markdown(
-    """
-<style>
-@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&display=swap');
-
-#MainMenu, header, footer {visibility: hidden;}
-html, body, [class*="css"] { font-family: 'Manrope', -apple-system, sans-serif; }
-
-.block-container { max-width: 600px; padding-top: 2.5rem; padding-bottom: 3rem; }
-
-/* Light palette pinned explicitly: the page colours below assume a white
-   background, and in a dark browser/OS theme Streamlit would otherwise
-   draw its own light text on top of it. */
-.stApp, [data-testid="stAppViewContainer"], [data-testid="stMain"] { background: #ffffff; color: #18181b; }
-[data-testid="stMarkdownContainer"] p, [data-testid="stMarkdownContainer"] li { color: #27272a; }
-[data-testid="stWidgetLabel"] p, [data-testid="stWidgetLabel"] label { color: #27272a; }
-[data-testid="stCaptionContainer"], [data-testid="stCaptionContainer"] p { color: #52525b; }
-[data-testid="stExpander"] summary p, [data-testid="stExpander"] summary span { color: #18181b; }
-div.stButton > button[kind="secondary"] { background: #ffffff; }
-div.stButton > button[kind="secondary"] p { color: #18181b; }
-div.stButton > button[kind="primary"] p { color: #18181b !important; font-weight: 700; }
-div[data-testid="stFormSubmitButton"] button p { color: #18181b !important; }
-
-/* Dropdown menu (opens in a floating layer): white, thin border, light-grey hover. */
-[data-testid="stSelectboxVirtualDropdown"], [data-testid="stSelectboxVirtualDropdown"] > div,
-[role="listbox"], ul[role="listbox"] { background: #ffffff !important; color: #18181b !important; }
-div:has(> [data-testid="stSelectboxVirtualDropdown"]),
-div:has(> div > [data-testid="stSelectboxVirtualDropdown"]),
-div:has(> [role="listbox"]), div:has(> ul[role="listbox"]) {
-    background: #ffffff !important; border: 1px solid #e4e4e7 !important; border-radius: 10px !important;
-    box-shadow: 0 4px 14px rgba(24,24,27,0.08) !important;
-}
-[role="option"], [role="option"] * { background-color: transparent !important; color: #18181b !important; }
-[role="option"]:hover, [role="option"][aria-selected="true"] { background-color: #f4f4f5 !important; }
-
-/* Inputs and dropdowns: white, soft border, grey-black border when clicked. */
-[data-testid="stTextInputRootElement"],
-[data-testid="stSelectbox"] div:has(> input),
-div[data-baseweb="input"], div[data-baseweb="select"] > div {
-    background: #ffffff !important; border: 1px solid #e4e4e7 !important; border-radius: 10px !important;
-    box-shadow: none !important;
-}
-[data-testid="stTextInputRootElement"]:focus-within,
-[data-testid="stSelectbox"] div:has(> input):focus-within,
-div[data-baseweb="input"]:focus-within, div[data-baseweb="select"] > div:focus-within {
-    border-color: #52525b !important;
-}
-div[data-baseweb="base-input"] { background: #ffffff !important; border: none !important; }
-[data-testid="stTextInputRootElement"] input, [data-testid="stSelectbox"] input,
-[data-testid="stSelectbox"] [data-baseweb="select"] div, [data-testid="stSelectbox"] [data-baseweb="select"] span {
-    color: #18181b !important; -webkit-text-fill-color: #18181b; background: transparent !important;
-}
-[data-testid="stTextInputRootElement"] input:disabled, [data-testid="stSelectbox"] input:disabled {
-    color: #3f3f46 !important; -webkit-text-fill-color: #3f3f46 !important; opacity: 1 !important;
-}
-[data-testid="stTextInputRootElement"] input::placeholder { color: #71717a !important; -webkit-text-fill-color: #71717a; }
-[data-testid="stSelectbox"] svg { fill: #18181b; }
-div[data-baseweb="popover"] ul, div[data-baseweb="popover"] [role="listbox"] { background: #ffffff !important; }
-div[data-baseweb="popover"] li, div[data-baseweb="popover"] [role="option"],
-div[data-baseweb="popover"] li *, div[data-baseweb="popover"] [role="option"] * {
-    color: #18181b !important; background-color: transparent;
-}
-div[data-baseweb="popover"] li:hover, div[data-baseweb="popover"] [role="option"]:hover { background-color: #f4f4f5 !important; }
-
-.mh-title {
-    text-align: center; font-size: 2.3rem; font-weight: 800;
-    letter-spacing: -0.03em; margin-bottom: 0.2rem; color: #18181b;
-}
-.mh-subtitle { text-align: center; color: #52525b; font-size: 1.05rem; margin-bottom: 2.2rem; }
-
-.mh-card {
-    background: #ffffff; border: 1px solid #ececef; border-radius: 18px;
-    padding: 1rem 1.25rem; margin-bottom: 1.4rem;
-    box-shadow: 0 2px 10px rgba(24,24,27,0.05);
-}
-
-.mh-row-header {
-    font-size: 0.72rem; font-weight: 700; color: #52525b;
-    text-transform: uppercase; letter-spacing: 0.06em; padding: 0.4rem 0 0.3rem 0.2rem;
-}
-
-.mh-avatar {
-    width: 34px; height: 34px; border-radius: 50%;
-    background: #e4e4e7; border: 1px solid #a1a1aa;
-    color: #18181b; display: flex; align-items: center; justify-content: center;
-    font-weight: 700; font-size: 0.95rem; margin-top: 0.35rem;
-}
-
-.mh-location-set { padding-top: 0.5rem; font-size: 0.92rem; color: #18181b; }
-.mh-location-unset { padding-top: 0.5rem; font-size: 0.92rem; color: #52525b; font-style: italic; }
-
-.mh-section-label {
-    font-weight: 700; font-size: 0.95rem; color: #27272a; margin: 1.5rem 0 0.6rem 0;
-}
-.mh-section-hint { color: #52525b; font-size: 0.85rem; margin: -0.3rem 0 0.7rem 0; }
-
-div.stButton > button {
-    border-radius: 999px; font-weight: 700; border: 1px solid #e4e4e7;
-    transition: all 0.15s ease;
-}
-div.stButton > button[kind="primary"] {
-    background: #e4e4e7; border: 1px solid #52525b; color: #18181b;
-}
-div.stButton > button[kind="primary"]:hover { background: #d4d4d8; }
-div[data-testid="stFormSubmitButton"] button {
-    border-radius: 12px; font-weight: 700; border: 1px solid #52525b;
-    background: #e4e4e7; color: #18181b;
-}
-
-.mh-eyebrow {
-    text-align: center; color: #52525b; text-transform: uppercase;
-    letter-spacing: 0.1em; font-size: 0.8rem; font-weight: 700; margin-top: 0.5rem;
-}
-.mh-area-name {
-    text-align: center; font-size: 2.5rem; font-weight: 800;
-    letter-spacing: -0.02em; margin: 0.2rem 0 1.2rem 0; color: #18181b;
-}
-
-.mh-person-row {
-    display: flex; justify-content: space-between; align-items: center;
-    padding: 0.6rem 0; border-bottom: 1px solid #f4f4f5; font-size: 1.02rem;
-}
-.mh-person-row:last-child { border-bottom: none; }
-.mh-person-main { display: flex; flex-direction: column; }
-.mh-person-location { font-size: 0.8rem; color: #52525b; margin-top: 0.15rem; font-weight: 400; }
-.mh-time { font-variant-numeric: tabular-nums; color: #18181b; font-weight: 700; white-space: nowrap; }
-.mh-mode-badge {
-    font-size: 0.72rem; font-weight: 600; color: #3f3f46; background: #f4f4f5;
-    border-radius: 999px; padding: 0.15rem 0.55rem; margin-left: 0.5rem;
-}
-
-.mh-summary { text-align: center; color: #3f3f46; margin: 0.7rem 0 1.5rem 0; font-weight: 500; }
-
-.mh-warning-banner {
-    background: #fef9e7; border: 1px solid #fde68a; color: #92400e;
-    border-radius: 14px; padding: 0.8rem 1.1rem; font-size: 0.9rem; margin: 0 0 1.3rem 0;
-}
-
-.mh-place-row { padding: 0.55rem 0; border-bottom: 1px solid #f4f4f5; }
-.mh-place-row:last-child { border-bottom: none; }
-.mh-place-address { color: #52525b; font-size: 0.88rem; }
-</style>
-""",
-    unsafe_allow_html=True,
-)
-
-
-def _get_query_param(name: str):
-    try:
-        value = st.query_params.get(name)
-        return value[0] if isinstance(value, list) else value
-    except Exception:
-        try:
-            values = st.experimental_get_query_params().get(name)
-            return values[0] if values else None
-        except Exception:
-            return None
-
-
-def _set_query_param(name: str, value: str) -> None:
-    try:
-        st.query_params[name] = value
-    except Exception:
-        try:
-            st.experimental_set_query_params(**{name: value})
-        except Exception:
-            pass
-
-
-def _clear_query_params() -> None:
-    try:
-        st.query_params.clear()
-    except Exception:
-        try:
-            st.experimental_set_query_params()
-        except Exception:
-            pass
-
-
-def init_state() -> None:
-    defaults = {
-        "stage": "setup",
-        "people": [dict(p) for p in DEFAULT_PEOPLE],
-        "purpose": "Café",
-        "result": None,
-        "restore_failed": False,
-        "last_processed_click": None,
-        "pending_people": None,
-        "search_error": None,
-    }
-    for key, value in defaults.items():
-        if key not in st.session_state:
-            st.session_state[key] = value
-
-
-def maybe_restore_from_url() -> None:
-    """If this session has no result in memory but the URL names a saved
-    plan, reload it from SQLite — restores after a refresh or a dropped
-    session, and is also exactly how a shared link opens for someone else."""
-    if st.session_state.get("result"):
-        return
-    plan_id = _get_query_param("plan")
-    if not plan_id:
-        return
-    plan = storage.load_plan(plan_id)
-    if plan is None:
-        st.session_state.restore_failed = True
-        return
-    st.session_state.result = plan
-    st.session_state.stage = "result"
-
-
 def _embed_html(markup: str, height: int) -> None:
     """st.iframe on current Streamlit; components.html (removed in newer
     releases) only as a fallback for older installs."""
@@ -282,14 +8,30 @@ def _embed_html(markup: str, height: int) -> None:
         components.html(markup, height=height)
 
 
+def _get_base_url() -> str:
+    """The public address of the deployed app, e.g. https://meethalfway.streamlit.app
+    Read from the APP_BASE_URL environment variable (.env) or, on Streamlit
+    Community Cloud, from the app's Secrets. Empty when running locally."""
+    url = os.getenv("APP_BASE_URL", "")
+    if not url:
+        try:
+            url = st.secrets.get("APP_BASE_URL", "")
+        except Exception:
+            url = ""
+    return (url or "").strip().rstrip("/")
+
+
 def render_copy_link_box() -> None:
-    """A small HTML/JS widget that reads the browser's own current URL
-    (which already includes ?plan=... once a search has run) and offers a
-    one-click copy. Runs inside an iframe, so it reads window.parent's
-    location, not its own — otherwise it would copy the iframe's address
-    instead of the actual app page."""
-    _embed_html(
-        """
+    """A small HTML/JS widget showing the shareable link with a one-click
+    copy. When APP_BASE_URL is set, the link is built from it (the public
+    address plus ?plan=<id>), so it works on a friend's laptop. Without it
+    (local runs) the widget falls back to the browser's own current URL,
+    read from window.parent since the widget runs inside an iframe."""
+    plan_id = _get_query_param("plan")
+    base = _get_base_url()
+    shared_link = f"{base}/?plan={plan_id}" if base and plan_id else ""
+
+    markup = """
         <div style="display:flex; gap:8px; align-items:center; font-family:'Manrope',sans-serif;">
           <input id="mh-link" readonly
                  style="flex:1; padding:11px 14px; border-radius:12px; border:1px solid #e4e4e7;
@@ -300,7 +42,7 @@ def render_copy_link_box() -> None:
                          font-weight:700; font-size:0.88rem; cursor:pointer;">Copy</button>
         </div>
         <script>
-          const link = window.parent.location.href;
+          const link = __LINK__ || window.parent.location.href;
           document.getElementById('mh-link').value = link;
           const btn = document.getElementById('mh-copy-btn');
           btn.onclick = function () {
@@ -309,9 +51,8 @@ def render_copy_link_box() -> None:
             setTimeout(() => { btn.innerText = 'Copy'; }, 1500);
           };
         </script>
-        """,
-        height=64,
-    )
+        """.replace("__LINK__", json.dumps(shared_link))
+    _embed_html(markup, height=64)
 
 
 def start_search() -> None:
@@ -493,6 +234,14 @@ def render_location_picker() -> None:
 
 
 def render_setup(searching: bool = False) -> None:
+    if searching:
+        # While searching, hide the previous screen's leftover (faded) elements
+        # instead of letting them linger below the progress text.
+        st.markdown(
+            '<style>[data-stale="true"] { display: none !important; }</style>',
+            unsafe_allow_html=True,
+        )
+
     if not searching and st.session_state.get("search_error"):
         st.error(st.session_state.search_error)
         st.session_state.search_error = None
@@ -730,3 +479,4 @@ with _page.container():
         render_setup(searching=True)
     else:
         render_result()
+
