@@ -69,8 +69,24 @@ GOA_VIEWBOX = [
 _geolocator = Nominatim(user_agent=NOMINATIM_USER_AGENT)
 # Nominatim's usage policy: max 1 request/second. Geocode and reverse share
 # one rate limiter since both hit the same Nominatim instance.
-_rate_limited_geocode = RateLimiter(_geolocator.geocode, min_delay_seconds=1.0)
-_rate_limited_reverse = RateLimiter(_geolocator.reverse, min_delay_seconds=1.0)
+# swallow_exceptions=False: geopy's default quietly returns None on any error
+# (blocked, rate-limited, timed out), which the UI then mistook for "place not
+# found" and for "no area name". Errors now raise so we can fall back to Photon.
+_rate_limited_geocode = RateLimiter(
+    _geolocator.geocode, min_delay_seconds=1.0, max_retries=1, error_wait_seconds=2.0,
+    swallow_exceptions=False,
+)
+_rate_limited_reverse = RateLimiter(
+    _geolocator.reverse, min_delay_seconds=1.0, max_retries=1, error_wait_seconds=2.0,
+    swallow_exceptions=False,
+)
+
+# Photon (photon.komoot.io) is a free OpenStreetMap-based geocoder with no key.
+# Used when Nominatim fails: shared cloud hosts (e.g. Streamlit Community
+# Cloud) are often blocked or rate-limited by Nominatim even though it works
+# fine from a home connection.
+PHOTON_URL = os.getenv("PHOTON_URL", "https://photon.komoot.io")
+_PHOTON_HEADERS = {"User-Agent": NOMINATIM_USER_AGENT}
 
 
 class RoutingError(Exception):
@@ -87,23 +103,62 @@ def is_estimated(mode: str) -> bool:
     return mode == "Public transport"
 
 
+def _in_goa(lat: float, lon: float) -> bool:
+    return (GOA_BOUNDS["lat_min"] <= lat <= GOA_BOUNDS["lat_max"]
+            and GOA_BOUNDS["lon_min"] <= lon <= GOA_BOUNDS["lon_max"])
+
+
+def _photon_label(props: dict) -> str:
+    parts = []
+    for key in ("name", "locality", "suburb", "city", "district", "state"):
+        v = props.get(key)
+        if v and v not in parts:
+            parts.append(v)
+    return ", ".join(parts)
+
+
+def _photon_search_in_goa(query: str) -> Optional[Tuple[float, float, str]]:
+    bbox = f"{GOA_BOUNDS['lon_min']},{GOA_BOUNDS['lat_min']},{GOA_BOUNDS['lon_max']},{GOA_BOUNDS['lat_max']}"
+    resp = requests.get(
+        f"{PHOTON_URL}/api/",
+        params={"q": query, "bbox": bbox, "limit": 3, "lang": "en"},
+        headers=_PHOTON_HEADERS, timeout=15,
+    )
+    resp.raise_for_status()
+    for feat in resp.json().get("features", []):
+        lon, lat = feat["geometry"]["coordinates"][:2]
+        if _in_goa(lat, lon):
+            return lat, lon, _photon_label(feat.get("properties", {}))
+    return None
+
+
 def geocode_in_goa(query: str) -> Tuple[float, float, str]:
     """
-    Geocode restricted to Goa, India via Nominatim's viewbox + bounded
-    params — bounded=True means Nominatim excludes anything outside the
-    box entirely, rather than merely preferring results inside it. Returns
-    (lat, lon, display_label) using Nominatim's own formatted address as
-    the label, since it's already in hand (no extra reverse-geocode call
-    needed).
+    Geocode restricted to Goa, India. Tries Nominatim first (viewbox +
+    bounded=True, so anything outside the box is excluded outright), then
+    falls back to Photon if Nominatim errors out or finds nothing. Returns
+    (lat, lon, display_label).
     """
+    nominatim_error = None
     try:
         location = _rate_limited_geocode(query, viewbox=GOA_VIEWBOX, bounded=True)
+        if location is not None:
+            return location.latitude, location.longitude, location.address
     except Exception as exc:
-        raise RoutingError(f"Geocoding service error for '{query}': {exc}") from exc
+        nominatim_error = exc
 
-    if location is None:
-        raise RoutingError(f"Couldn't find '{query}' within Goa. Try a more specific search.")
-    return location.latitude, location.longitude, location.address
+    try:
+        found = _photon_search_in_goa(query)
+        if found:
+            return found
+    except Exception as exc:
+        if nominatim_error is not None:
+            raise RoutingError(
+                f"The location search services aren't responding right now ({type(exc).__name__}). "
+                f"Please try again in a minute."
+            ) from exc
+
+    raise RoutingError(f"Couldn't find '{query}' within Goa. Try a more specific search.")
 
 
 def geocode(address: str) -> Tuple[float, float]:
@@ -121,31 +176,56 @@ def geocode(address: str) -> Tuple[float, float]:
     return location.latitude, location.longitude
 
 
+def _photon_reverse_name(point: Tuple[float, float]) -> Optional[str]:
+    lat, lon = point
+    resp = requests.get(
+        f"{PHOTON_URL}/reverse",
+        params={"lat": lat, "lon": lon, "lang": "en"},
+        headers=_PHOTON_HEADERS, timeout=15,
+    )
+    resp.raise_for_status()
+    feats = resp.json().get("features", [])
+    if not feats:
+        return None
+    props = feats[0].get("properties", {})
+    return (
+        props.get("suburb") or props.get("locality") or props.get("city")
+        or props.get("district") or props.get("county") or props.get("name")
+    )
+
+
 def reverse_geocode(point: Tuple[float, float]) -> str:
     """
     Turn coordinates back into a human-readable area name (e.g. "Bambolim")
-    so the result screen can say where to meet, not just show a pin. Falls
-    back to a lat/lon string if Nominatim has nothing better to offer.
+    so the result screen can say where to meet, not just show a pin. Tries
+    Nominatim, then Photon; only falls back to a lat/lon string if both fail.
     """
     lat, lon = point
     try:
         location = _rate_limited_reverse((lat, lon), zoom=14)
+        if location is not None:
+            addr = location.raw.get("address", {})
+            name = (
+                addr.get("suburb")
+                or addr.get("neighbourhood")
+                or addr.get("village")
+                or addr.get("town")
+                or addr.get("city_district")
+                or addr.get("city")
+            )
+            if name:
+                return name
     except Exception:
-        return f"{lat:.4f}, {lon:.4f}"
+        pass
 
-    if location is None:
-        return f"{lat:.4f}, {lon:.4f}"
+    try:
+        name = _photon_reverse_name((lat, lon))
+        if name:
+            return name
+    except Exception:
+        pass
 
-    addr = location.raw.get("address", {})
-    name = (
-        addr.get("suburb")
-        or addr.get("neighbourhood")
-        or addr.get("village")
-        or addr.get("town")
-        or addr.get("city_district")
-        or addr.get("city")
-    )
-    return name or f"{lat:.4f}, {lon:.4f}"
+    return f"{lat:.4f}, {lon:.4f}"
 
 
 def _osrm_table(
