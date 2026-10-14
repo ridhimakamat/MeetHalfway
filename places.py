@@ -244,3 +244,4 @@ def search_places_with_fallback(
         "error": all_failed,
         "error_detail": last_error if all_failed else None,
     }
+    #commiting just so my website doesnt sleeeeeep
